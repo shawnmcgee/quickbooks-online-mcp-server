@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
+import type { ConnectionStore } from '../store/company-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -78,6 +79,10 @@ export class QuickbooksClient {
   private oauthClient: OAuthClient;
   private isAuthenticating: boolean = false;
   private redirectUri: string;
+  // Set for clients backed by the company store (src/store): tokens are read
+  // from and saved there instead of .env, and a missing or rejected token
+  // raises store.reconnectRequired() instead of the interactive OAuth flow.
+  private readonly store?: ConnectionStore;
 
   // Refresh 5 minutes before actual expiry to avoid edge cases
   private static readonly TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -99,7 +104,9 @@ export class QuickbooksClient {
     realmId?: string;
     environment: string;
     redirectUri: string;
+    store?: ConnectionStore;
   }) {
+    this.store = config.store;
     this.clientId = config.clientId;
     this.clientSecret = config.clientSecret;
     this.refreshToken = config.refreshToken;
@@ -126,8 +133,9 @@ export class QuickbooksClient {
   // Claude Desktop and Claude Code simultaneously), and Intuit invalidates the
   // previous refresh token on every rotation — so a token loaded into memory at
   // startup can be silently superseded on disk by another process.
-  private readPersistedRefreshToken(): string | undefined {
+  private async readPersistedRefreshToken(): Promise<string | undefined> {
     try {
+      if (this.store) return (await this.store.loadRefreshToken()) || undefined;
       // Parse with dotenv itself so the value is normalized identically to how
       // the in-memory token was loaded at startup — surrounding quotes stripped,
       // inline comments removed, optional `export ` prefix handled. A naive
@@ -247,6 +255,12 @@ export class QuickbooksClient {
   }
 
   private async startOAuthFlow(): Promise<void> {
+    // Store-backed clients never run this flow; reconnecting is a separate,
+    // user-initiated step.
+    if (this.store) {
+      throw await this.store.reconnectRequired('no saved sign-in token');
+    }
+
     // The interactive flow below binds a localhost callback server, but Intuit
     // rejects localhost redirect URIs for production apps — so this can only
     // ever succeed in sandbox. Fail fast with guidance rather than opening a
@@ -530,7 +544,7 @@ export class QuickbooksClient {
           if (!this.isAuthInvalidation(firstErr)) {
             throw firstErr;
           }
-          const latest = this.readPersistedRefreshToken();
+          const latest = await this.readPersistedRefreshToken();
           if (latest && latest !== this.refreshToken) {
             this.refreshToken = latest;
             token = await this.performRefresh(latest);
@@ -551,8 +565,13 @@ export class QuickbooksClient {
         if (newRefreshToken && newRefreshToken !== this.refreshToken) {
           this.refreshToken = newRefreshToken;
           try {
-            this.saveTokensToEnv();
-            console.error('[qbo-client] Refresh token rotated and persisted to .env');
+            if (this.store) {
+              await this.store.saveRefreshToken(newRefreshToken);
+              console.error('[qbo-client] Refresh token rotated and saved to the company store');
+            } else {
+              this.saveTokensToEnv();
+              console.error('[qbo-client] Refresh token rotated and persisted to .env');
+            }
           } catch (persistErr) {
             // Don't fail the whole refresh just because we couldn't write to
             // disk; the in-memory token is still valid for this process.
@@ -624,6 +643,9 @@ export class QuickbooksClient {
             }
             // Past here the refresh token is genuinely dead (revoked, expired
             // past the 100-day window, or rotated out).
+            if (this.store) {
+              throw await this.store.reconnectRequired(message);
+            }
             if (this.environment === 'production') {
               // The interactive fallback cannot help (localhost redirect is
               // rejected, and nobody is watching a host-spawned subprocess to
